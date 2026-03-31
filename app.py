@@ -127,7 +127,7 @@ def newsvendor_surge(price, salvage, surge_cost, mu, sigma, holding_per_period, 
 
 
 def dual_source_sweep(price, salvage, mu, sigma, base_cost, surge_cost,
-                       base_moq, surge_moq, holding_per_period, q_base_fixed):
+                       base_moq, surge_moq, holding_per_period, q_base_fixed, alpha):
     """
     Sweep target service levels 50–99.9%. Base Q is fixed. Surge fills the gap.
     Expected sales computed via exact normal loss function at each total Q.
@@ -135,6 +135,9 @@ def dual_source_sweep(price, salvage, mu, sigma, base_cost, surge_cost,
     """
     results = []
     surge_holding_per_period = (surge_cost / base_cost) * holding_per_period
+    
+    # NEW: Calculate the true economic value of leftover stock based on shelf life
+    effective_salvage = salvage + alpha * (price - salvage)
 
     for pct in np.arange(0.50, 0.999, 0.005):
         q_target    = mu + stats.norm.ppf(pct) * sigma
@@ -149,7 +152,10 @@ def dual_source_sweep(price, salvage, mu, sigma, base_cost, surge_cost,
         surge_leftover = exp_leftover * (1.0 - base_frac)
 
         revenue     = price * exp_sales
-        salvage_rev = salvage * exp_leftover
+        
+        # FIXED: Use effective_salvage so the profit curve respects your shelf-life slider
+        salvage_rev = effective_salvage * exp_leftover 
+        
         base_spend  = base_cost * q_base_fixed
         surge_spend = surge_cost * q_surge
         hold_cost   = (holding_per_period * base_leftover) + (surge_holding_per_period * surge_leftover)
@@ -195,9 +201,9 @@ if run:
 
     q_base_fixed = max(float(base_moq), nv_base["optimal_q"]) if nv_base["optimal_q"] >= base_moq else float(base_moq)
 
-    df_sweep = dual_source_sweep(selling_price, salvage_value, mean_demand, sigma,
+df_sweep = dual_source_sweep(selling_price, salvage_value, mean_demand, sigma,
                                   base_cost, surge_cost, base_moq, surge_moq,
-                                  holding_per_period, q_base_fixed)
+                                  holding_per_period, q_base_fixed, alpha) # <-- Added alpha here
 
     best_idx = df_sweep["Exp. Profit (£)"].idxmax()
     best     = df_sweep.loc[best_idx]
