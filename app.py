@@ -201,9 +201,9 @@ if run:
 
     q_base_fixed = max(float(base_moq), nv_base["optimal_q"]) if nv_base["optimal_q"] >= base_moq else float(base_moq)
 
-df_sweep = dual_source_sweep(selling_price, salvage_value, mean_demand, sigma,
-                                  base_cost, surge_cost, base_moq, surge_moq,
-                                  holding_per_period, q_base_fixed, alpha) # <-- Added alpha here
+    df_sweep = dual_source_sweep(selling_price, salvage_value, mean_demand, sigma,
+        base_cost, surge_cost, base_moq, surge_moq,
+        holding_per_period, q_base_fixed, alpha) # <-- Added alpha here
 
     best_idx = df_sweep["Exp. Profit (£)"].idxmax()
     best     = df_sweep.loc[best_idx]
