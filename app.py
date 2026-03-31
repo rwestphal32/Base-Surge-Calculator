@@ -88,14 +88,12 @@ def newsvendor_base(salvage, base_cost, surge_cost, mu, sigma, holding_per_perio
     """
     Base supplier in a dual-source model.
     Cu = surge_cost - base_cost
-         Under-ordering from base just triggers the surge premium — the sale is not lost.
-    Co = (base_cost - effective_salvage) + holding_per_period
-         Overage considers carry-forward (shelf life).
+    Co = holding_per_period + (1 - alpha) * (base_cost - salvage)
+         Overage considers carry-forward (shelf life). You only take the 
+         markdown hit on the inventory you CANNOT carry forward.
     """
-    effective_salvage = salvage + alpha * (price - salvage)
     cu = surge_cost - base_cost
-    co = (base_cost - effective_salvage) + holding_per_period
-    co = max(co, 1e-5) # Prevent division by zero if Co goes non-positive due to high alpha
+    co = holding_per_period + (1.0 - alpha) * (base_cost - salvage)
     
     if (cu + co) <= 0:
         return None
@@ -109,14 +107,12 @@ def newsvendor_base(salvage, base_cost, surge_cost, mu, sigma, holding_per_perio
 
 def newsvendor_surge(price, salvage, surge_cost, mu, sigma, holding_per_period, alpha):
     """
-    Surge supplier — last resort. A stockout here is a genuine lost sale.
+    Surge supplier — last resort.
     Cu = price - surge_cost   (full lost margin)
-    Co = (surge_cost - effective_salvage) + holding_per_period
+    Co = holding_per_period + (1 - alpha) * (surge_cost - salvage)
     """
-    effective_salvage = salvage + alpha * (price - salvage)
     cu = price - surge_cost
-    co = (surge_cost - effective_salvage) + holding_per_period
-    co = max(co, 1e-5) # Prevent division by zero
+    co = holding_per_period + (1.0 - alpha) * (surge_cost - salvage)
     
     if (cu + co) <= 0:
         return None
