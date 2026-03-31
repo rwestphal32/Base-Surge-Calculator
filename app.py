@@ -22,6 +22,8 @@ with st.sidebar:
     selling_price = st.number_input("Selling Price (£)", value=60.0, step=1.0)
     salvage_value = st.number_input("Salvage / Markdown Value (£)", value=10.0, step=1.0,
                                     help="What you recover per unit if you over-order and discount unsold stock.")
+    alpha = st.slider("Inventory Carry-Forward (%)", 0, 100, 70,
+                      help="Percent of leftover inventory expected to sell later at full price (Shelf Life Factor). Higher % = Lower overage cost.") / 100.0
 
     st.markdown("---")
     st.header("📈 Demand Profile")
@@ -82,16 +84,19 @@ def expected_metrics(q, mu, sigma):
     return exp_sales, exp_leftover, exp_stockout
 
 
-def newsvendor_base(salvage, base_cost, surge_cost, mu, sigma, holding_per_period):
+def newsvendor_base(salvage, base_cost, surge_cost, mu, sigma, holding_per_period, price, alpha):
     """
     Base supplier in a dual-source model.
     Cu = surge_cost - base_cost
          Under-ordering from base just triggers the surge premium — the sale is not lost.
-    Co = (base_cost - salvage) + holding_per_period
-         Markdown loss plus holding cost on leftover inventory over the lead time.
+    Co = (base_cost - effective_salvage) + holding_per_period
+         Overage considers carry-forward (shelf life).
     """
+    effective_salvage = salvage + alpha * (price - salvage)
     cu = surge_cost - base_cost
-    co = (base_cost - salvage) + holding_per_period
+    co = (base_cost - effective_salvage) + holding_per_period
+    co = max(co, 1e-5) # Prevent division by zero if Co goes non-positive due to high alpha
+    
     if (cu + co) <= 0:
         return None
     cr = cu / (cu + co)
@@ -102,14 +107,17 @@ def newsvendor_base(salvage, base_cost, surge_cost, mu, sigma, holding_per_perio
                 exp_sales=exp_sales, exp_leftover=exp_leftover, exp_stockout=exp_stockout)
 
 
-def newsvendor_surge(price, salvage, surge_cost, mu, sigma, holding_per_period):
+def newsvendor_surge(price, salvage, surge_cost, mu, sigma, holding_per_period, alpha):
     """
     Surge supplier — last resort. A stockout here is a genuine lost sale.
     Cu = price - surge_cost   (full lost margin)
-    Co = (surge_cost - salvage) + holding_per_period
+    Co = (surge_cost - effective_salvage) + holding_per_period
     """
+    effective_salvage = salvage + alpha * (price - salvage)
     cu = price - surge_cost
-    co = (surge_cost - salvage) + holding_per_period
+    co = (surge_cost - effective_salvage) + holding_per_period
+    co = max(co, 1e-5) # Prevent division by zero
+    
     if (cu + co) <= 0:
         return None
     cr = cu / (cu + co)
@@ -182,8 +190,8 @@ if run:
         st.error("Selling price must be above the surge unit cost.")
         st.stop()
 
-    nv_base  = newsvendor_base(salvage_value, base_cost, surge_cost, mean_demand, sigma, holding_per_period)
-    nv_surge = newsvendor_surge(selling_price, salvage_value, surge_cost, mean_demand, sigma, holding_per_period)
+    nv_base  = newsvendor_base(salvage_value, base_cost, surge_cost, mean_demand, sigma, holding_per_period, selling_price, alpha)
+    nv_surge = newsvendor_surge(selling_price, salvage_value, surge_cost, mean_demand, sigma, holding_per_period, alpha)
 
     if not nv_base or not nv_surge:
         st.error("Check inputs — verify costs are valid relative to price and salvage.")
@@ -296,8 +304,8 @@ if run:
                     f"- Unit Cost: **£{base_cost:.2f}**\n"
                     f"- **Cu** = surge cost − base cost = **£{nv_base['cu']:.2f}**/unit  \n"
                     f"  *(under-ordering from base only triggers the surge premium — the sale is not lost)*\n"
-                    f"- **Co** = base cost − salvage + holding = **£{nv_base['co']:.2f}**/unit  \n"
-                    f"  *(£{base_cost - salvage_value:.2f} markdown + £{holding_per_period:.2f} holding over {base_lead_time} weeks)*\n"
+                    f"- **Co** = base cost − effective salvage + holding = **£{nv_base['co']:.2f}**/unit  \n"
+                    f"  *(Includes £{holding_per_period:.2f} holding over {base_lead_time} weeks and shelf-life carry-forward)*\n"
                     f"- Critical Ratio: **{nv_base['critical_ratio']:.3f}** → commit to **{nv_base['critical_ratio']*100:.1f}th percentile**\n"
                     f"- Z-score: **{nv_base['z_score']:.3f}**\n"
                     f"- Newsvendor Optimal Q: **{int(nv_base['optimal_q']):,} units**\n"
@@ -311,8 +319,8 @@ if run:
                     f"- Unit Cost: **£{surge_cost:.2f}**\n"
                     f"- **Cu** = price − surge cost = **£{nv_surge['cu']:.2f}**/unit  \n"
                     f"  *(surge is last resort — a stockout here is a genuine lost sale)*\n"
-                    f"- **Co** = surge cost − salvage + holding = **£{nv_surge['co']:.2f}**/unit  \n"
-                    f"  *(£{surge_cost - salvage_value:.2f} markdown + £{surge_hold:.2f} holding)*\n"
+                    f"- **Co** = surge cost − effective salvage + holding = **£{nv_surge['co']:.2f}**/unit  \n"
+                    f"  *(Includes holding cost and shelf-life carry-forward)*\n"
                     f"- Critical Ratio: **{nv_surge['critical_ratio']:.3f}** → target **{nv_surge['critical_ratio']*100:.1f}th percentile**\n"
                     f"- Z-score: **{nv_surge['z_score']:.3f}**\n"
                     f"- Standalone Optimal Q: **{int(nv_surge['optimal_q']):,} units**\n"
