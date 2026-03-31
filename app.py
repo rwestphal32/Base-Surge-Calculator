@@ -56,10 +56,18 @@ with st.sidebar:
 # ─────────────────────────────────────────────
 # CORE NEWSVENDOR ENGINE
 # ─────────────────────────────────────────────
-def newsvendor_analysis(price, salvage, cost, mu, sigma):
-    """Returns critical ratio, optimal Q, and expected metrics."""
-    underage_cost  = price - cost       # cost of stocking out (lost margin)
-    overage_cost   = cost - salvage     # cost of over-ordering (markdown loss)
+def newsvendor_base(salvage, base_cost, surge_cost, mu, sigma, holding_per_period):
+    """
+    Base supplier newsvendor in a dual-source model.
+    Cu (base) = surge_cost - base_cost
+        → Under-ordering from base doesn't lose the sale; it just means paying
+          the surge premium to cover that unit instead.
+    Co (base) = base_cost - salvage + holding_per_period
+        → Over-ordering from base means markdown loss PLUS the cost of holding
+          that inventory for the period.
+    """
+    underage_cost = surge_cost - base_cost
+    overage_cost  = (base_cost - salvage) + holding_per_period
 
     if (underage_cost + overage_cost) <= 0:
         return None
@@ -68,13 +76,13 @@ def newsvendor_analysis(price, salvage, cost, mu, sigma):
     z = stats.norm.ppf(critical_ratio)
     optimal_q = max(0, mu + z * sigma)
 
-    # Expected sales, leftover, stockout
     exp_sales    = mu - sigma * stats.norm.pdf(z) + optimal_q * (1 - stats.norm.cdf(z))
     exp_sales    = min(exp_sales, optimal_q)
     exp_leftover = max(0, optimal_q - exp_sales)
     exp_stockout = max(0, mu - exp_sales)
 
-    exp_profit = (price * exp_sales) + (salvage * exp_leftover) - (cost * optimal_q)
+    # Profit here is partial — base doesn't capture the full sale revenue alone
+    exp_profit = -(base_cost * optimal_q) - (holding_per_period * exp_leftover) + (salvage * exp_leftover)
 
     return {
         "critical_ratio": critical_ratio,
@@ -89,44 +97,75 @@ def newsvendor_analysis(price, salvage, cost, mu, sigma):
     }
 
 
-def dual_source_split(price, salvage, mu, sigma, base_cost, surge_cost, base_moq, surge_moq):
+def newsvendor_surge(price, salvage, surge_cost, mu, sigma, holding_per_period):
     """
-    Dual sourcing logic:
-    - Base order covers the newsvendor Q computed at base supplier's cost.
-    - For each additional unit above that, we check: is the surge premium cheaper than the stockout cost?
-    - The surge quantity covers the demand between the base Q and the surge-adjusted optimal Q.
-    Returns a sweep of results across percentile thresholds so we can plot the tradeoff.
+    Surge supplier newsvendor — last resort, so a stockout here IS a lost sale.
+    Cu (surge) = price - surge_cost   → true lost margin
+    Co (surge) = surge_cost - salvage + holding_per_period
+    """
+    underage_cost = price - surge_cost
+    overage_cost  = (surge_cost - salvage) + holding_per_period
+
+    if (underage_cost + overage_cost) <= 0:
+        return None
+
+    critical_ratio = underage_cost / (underage_cost + overage_cost)
+    z = stats.norm.ppf(critical_ratio)
+    optimal_q = max(0, mu + z * sigma)
+
+    exp_sales    = mu - sigma * stats.norm.pdf(z) + optimal_q * (1 - stats.norm.cdf(z))
+    exp_sales    = min(exp_sales, optimal_q)
+    exp_leftover = max(0, optimal_q - exp_sales)
+    exp_stockout = max(0, mu - exp_sales)
+
+    exp_profit = (price * exp_sales) + (salvage * exp_leftover) - (surge_cost * optimal_q) - (holding_per_period * exp_leftover)
+
+    return {
+        "critical_ratio": critical_ratio,
+        "z_score": z,
+        "optimal_q": optimal_q,
+        "underage_cost": underage_cost,
+        "overage_cost": overage_cost,
+        "exp_sales": exp_sales,
+        "exp_leftover": exp_leftover,
+        "exp_stockout": exp_stockout,
+        "exp_profit": exp_profit,
+    }
+
+
+def dual_source_split(price, salvage, mu, sigma, base_cost, surge_cost,
+                       base_moq, surge_moq, holding_per_period):
+    """
+    Sweep every target service level. Base Q is fixed at the dual-source
+    newsvendor optimal (using corrected Cu/Co). Surge fills the gap up to
+    each target percentile. We find the peak expected profit.
     """
     results = []
     percentiles = np.arange(0.50, 0.999, 0.005)
 
+    nv_base = newsvendor_base(salvage, base_cost, surge_cost, mu, sigma, holding_per_period)
+    q_base_raw = nv_base["optimal_q"] if nv_base else mu
+    q_base = max(base_moq, q_base_raw) if q_base_raw >= base_moq else base_moq
+
     for pct in percentiles:
         q_total = mu + stats.norm.ppf(pct) * sigma
 
-        # Base covers what newsvendor says at base cost; can't go below MOQ if ordering
-        base_nv     = newsvendor_analysis(price, salvage, base_cost, mu, sigma)
-        q_base_raw  = base_nv["optimal_q"] if base_nv else mu
-        q_base      = max(base_moq, q_base_raw) if q_base_raw >= base_moq else 0
-
-        # Surge fills the gap between base commitment and total target Q
         q_surge_raw = max(0, q_total - q_base)
-        q_surge     = max(surge_moq, q_surge_raw) if q_surge_raw >= surge_moq else 0
+        q_surge = max(surge_moq, q_surge_raw) if q_surge_raw >= surge_moq else 0
 
         q_total_actual = q_base + q_surge
 
-        # Expected financials
-        sigma_eff = sigma
-        exp_sales    = mu - sigma_eff * stats.norm.pdf(stats.norm.ppf(pct)) + q_total_actual * (1 - pct)
+        exp_sales    = mu - sigma * stats.norm.pdf(stats.norm.ppf(pct)) + q_total_actual * (1 - pct)
         exp_sales    = min(exp_sales, q_total_actual)
         exp_leftover = max(0, q_total_actual - exp_sales)
         exp_stockout = max(0, mu - exp_sales)
 
-        revenue        = price * exp_sales
-        salvage_rev    = salvage * exp_leftover
-        base_spend     = base_cost * q_base
-        surge_spend    = surge_cost * q_surge
-        stockout_cost  = (price - base_cost) * exp_stockout  # opportunity cost
-        exp_profit     = revenue + salvage_rev - base_spend - surge_spend
+        revenue      = price * exp_sales
+        salvage_rev  = salvage * exp_leftover
+        base_spend   = base_cost * q_base
+        surge_spend  = surge_cost * q_surge
+        holding_cost = holding_per_period * exp_leftover
+        exp_profit   = revenue + salvage_rev - base_spend - surge_spend - holding_cost
 
         results.append({
             "Service Level (%)": round(pct * 100, 1),
@@ -136,7 +175,7 @@ def dual_source_split(price, salvage, mu, sigma, base_cost, surge_cost, base_moq
             "Surge %": round(q_surge / q_total_actual * 100, 1) if q_total_actual > 0 else 0,
             "Base Spend (£)": round(base_spend),
             "Surge Spend (£)": round(surge_spend),
-            "Surge Premium (£)": round(surge_spend - (surge_cost - base_cost) * 0),  # incremental vs all-base
+            "Holding Cost (£)": round(holding_cost),
             "Exp. Stockout (units)": round(exp_stockout),
             "Exp. Leftover (units)": round(exp_leftover),
             "Exp. Profit (£)": round(exp_profit),
@@ -152,16 +191,17 @@ if run:
     sigma = mean_demand * (volatility_pct / 100.0)
     holding_per_unit_per_period = (base_cost * holding_cost_pct) / periods_per_year
 
-    # Run individual newsvendor for each supplier
-    nv_base  = newsvendor_analysis(selling_price, salvage_value, base_cost,  mean_demand, sigma)
-    nv_surge = newsvendor_analysis(selling_price, salvage_value, surge_cost, mean_demand, sigma)
+    # Run corrected dual-source newsvendor for each supplier role
+    nv_base  = newsvendor_base(salvage_value, base_cost, surge_cost, mean_demand, sigma, holding_per_unit_per_period)
+    nv_surge = newsvendor_surge(selling_price, salvage_value, surge_cost, mean_demand, sigma, holding_per_unit_per_period)
 
     if not nv_base or not nv_surge:
-        st.error("Check inputs — cost must be between salvage value and selling price.")
+        st.error("Check inputs — costs must be between salvage value and selling price, and surge cost must exceed base cost.")
         st.stop()
 
     df_sweep = dual_source_split(selling_price, salvage_value, mean_demand, sigma,
-                                  base_cost, surge_cost, base_moq, surge_moq)
+                                  base_cost, surge_cost, base_moq, surge_moq,
+                                  holding_per_unit_per_period)
 
     # Find the profit-maximizing row
     best_idx   = df_sweep["Exp. Profit (£)"].idxmax()
@@ -252,16 +292,20 @@ if run:
             surge_units = int(best_row["Q Surge"])
             surge_premium_per_unit = surge_cost - base_cost
             total_surge_premium = surge_units * surge_premium_per_unit
-            avoided_stockout_val = int(best_row["Exp. Stockout (units)"]) * (selling_price - base_cost)
 
-            st.metric("Surge Premium Paid", f"£{total_surge_premium:,}",
-                      help="Extra spend vs. ordering everything from base.")
-            st.metric("Stockout Cost at Base-Only", 
-                      f"£{int(nv_base['exp_stockout'] * (selling_price - base_cost)):,}",
-                      help="Lost margin if you only used the base supplier at its optimal Q.")
-            net_benefit = int(nv_base['exp_stockout'] * (selling_price - base_cost)) - total_surge_premium
-            st.metric("Net Benefit of Surge", f"£{net_benefit:,}",
-                      delta="Surge pays off" if net_benefit > 0 else "Surge too expensive",
+            # What would have been paid in surge premiums on ALL stockout units if base-only
+            base_only_stockout_units = int(nv_base["exp_stockout"])
+            base_only_surge_cost = base_only_stockout_units * surge_premium_per_unit
+
+            st.metric("Surge Premium Paid (incremental vs. all-base)",
+                      f"£{total_surge_premium:,}",
+                      help="Extra spend vs. ordering everything from the base supplier.")
+            st.metric("Unhedged Surge Exposure at Base-Only Commit",
+                      f"£{base_only_surge_cost:,}",
+                      help="Surge premiums you'd still have paid on stockout units without pre-ordering surge capacity.")
+            net_benefit = base_only_surge_cost - total_surge_premium
+            st.metric("Net Benefit of Pre-Ordering Surge", f"£{net_benefit:,}",
+                      delta="Pre-ordering surge pays off" if net_benefit > 0 else "Surge order too large",
                       delta_color="normal" if net_benefit > 0 else "inverse")
 
     # ── TAB 2: NEWSVENDOR MECHANICS ─────────────
@@ -271,36 +315,51 @@ if run:
             "equals the marginal cost of under-ordering**. The critical ratio is the service level that "
             "maximises expected profit — not revenue, not fill rate."
         )
+        st.info(
+            "⚠️ **Dual-source correction:** In a base-surge model, under-ordering from base does **not** "
+            "lose the sale — the surge supplier catches it. So the base supplier's underage cost (Cu) is "
+            "only the **surge premium** paid per unit, not the full lost margin. This deliberately lowers "
+            "the base critical ratio, keeping the base commitment conservative and letting surge handle the tail."
+        )
 
         col1, col2 = st.columns(2)
 
-        def nv_card(label, nv, cost, color):
+        def nv_card_base(nv, holding):
             with st.container(border=True):
-                st.markdown(f"**{label}**")
-                st.markdown(f"- Unit Cost: **£{cost:.2f}**")
-                st.markdown(f"- Underage Cost (Cu): **£{nv['underage_cost']:.2f}** *(lost margin per stockout unit)*")
-                st.markdown(f"- Overage Cost (Co): **£{nv['overage_cost']:.2f}** *(markdown loss per leftover unit)*")
-                st.markdown(f"- Critical Ratio: **{nv['critical_ratio']:.3f}** → order up to **{nv['critical_ratio']*100:.1f}th percentile**")
+                st.markdown("**🏭 Base Supplier — Dual-Source Role**")
+                st.markdown(f"- Unit Cost: **£{base_cost:.2f}**")
+                st.markdown(f"- **Cu (base)** = surge cost − base cost = **£{nv['underage_cost']:.2f}** *(surge premium per under-ordered unit)*")
+                st.markdown(f"- **Co (base)** = base cost − salvage + holding = **£{nv['overage_cost']:.2f}** *(markdown + holding cost per leftover unit)*")
+                st.markdown(f"- Critical Ratio: **{nv['critical_ratio']:.3f}** → commit to **{nv['critical_ratio']*100:.1f}th percentile**")
+                st.markdown(f"- Z-score: **{nv['z_score']:.3f}**")
+                st.markdown(f"- Optimal Base Commit: **{int(nv['optimal_q']):,} units**")
+
+        def nv_card_surge(nv, holding):
+            with st.container(border=True):
+                st.markdown("**⚡ Surge Supplier — Last Resort Role**")
+                st.markdown(f"- Unit Cost: **£{surge_cost:.2f}**")
+                st.markdown(f"- **Cu (surge)** = price − surge cost = **£{nv['underage_cost']:.2f}** *(true lost margin — no fallback exists)*")
+                st.markdown(f"- **Co (surge)** = surge cost − salvage + holding = **£{nv['overage_cost']:.2f}** *(markdown + holding cost per leftover unit)*")
+                st.markdown(f"- Critical Ratio: **{nv['critical_ratio']:.3f}** → target **{nv['critical_ratio']*100:.1f}th percentile**")
                 st.markdown(f"- Z-score: **{nv['z_score']:.3f}**")
                 st.markdown(f"- Standalone Optimal Q: **{int(nv['optimal_q']):,} units**")
-                st.markdown(f"- Expected Stockout: **{int(nv['exp_stockout']):,} units**")
-                st.markdown(f"- Expected Leftover: **{int(nv['exp_leftover']):,} units**")
-                st.markdown(f"- Expected Profit: **£{int(nv['exp_profit']):,}**")
+                st.markdown(f"- Expected Stockout (standalone): **{int(nv['exp_stockout']):,} units**")
+                st.markdown(f"- Expected Leftover (standalone): **{int(nv['exp_leftover']):,} units**")
 
         with col1:
-            nv_card("🏭 Base Supplier (Standalone)", nv_base, base_cost, "#10b981")
+            nv_card_base(nv_base, holding_per_unit_per_period)
         with col2:
-            nv_card("⚡ Surge Supplier (Standalone)", nv_surge, surge_cost, "#f59e0b")
+            nv_card_surge(nv_surge, holding_per_unit_per_period)
 
         st.markdown("---")
         st.markdown(
-            "**The key insight:** The base supplier's lower cost raises its critical ratio "
-            f"({nv_base['critical_ratio']:.3f}) vs. the surge supplier "
-            f"({nv_surge['critical_ratio']:.3f}). "
-            "In isolation, you'd order more from base because each unit is cheaper to over-stock. "
-            "But in a dual-source model, you *commit* to the base order early and use surge to "
-            "flexibly cover the uncertain tail — so you're not paying surge cost on every unit, "
-            "only on the incremental upside."
+            f"**The key insight:** Because under-ordering from base only costs the surge premium "
+            f"(£{nv_base['underage_cost']:.2f}/unit) rather than the full lost margin "
+            f"(£{nv_surge['underage_cost']:.2f}/unit), the base critical ratio "
+            f"({nv_base['critical_ratio']:.3f}) is intentionally **lower** than the surge critical ratio "
+            f"({nv_surge['critical_ratio']:.3f}). This is the correct result — it means you keep your "
+            f"cheap early commitment conservative, and rely on the fast surge supplier to cover upside "
+            f"demand rather than over-committing to base inventory that you'll have to markdown."
         )
 
     # ── TAB 3: DEMAND DISTRIBUTION ──────────────
@@ -369,9 +428,9 @@ if run:
         st.plotly_chart(fig2, use_container_width=True)
 
         st.markdown(
-            f"🟢 **Green zone** — demand covered by base order alone. Any demand here means you may have leftover stock at markdown value (£{salvage_value:.0f}/unit).  \n"
-            f"🟡 **Amber zone** — demand covered only because you placed the surge order. This is what the surge premium buys.  \n"
-            f"🔴 **Red zone** — demand scenarios above your total order. These result in a stockout at lost margin of £{selling_price - base_cost:.0f}/unit."
+            f"🟢 **Green zone** — demand covered by base order alone. Any demand here means you may have leftover stock at markdown value (£{salvage_value:.0f}/unit), plus holding cost of £{holding_per_unit_per_period:.2f}/unit.  \n"
+            f"🟡 **Amber zone** — demand covered only because you placed the surge order. This is what the surge premium (£{surge_cost - base_cost:.0f}/unit) buys.  \n"
+            f"🔴 **Red zone** — demand above your total order. A true lost sale at margin £{selling_price - surge_cost:.0f}/unit (price minus surge cost, since surge is last resort)."
         )
 
     # ── TAB 4: FULL SWEEP TABLE ──────────────────
@@ -404,19 +463,22 @@ else:
     st.info("👈 Configure your supplier parameters in the sidebar and click **Run Optimizer**.")
     st.markdown("""
     ### How this works
-    
-    **Step 1 — Newsvendor baseline:** For each supplier in isolation, the model finds the profit-maximising 
-    order quantity using the critical ratio: `Cu / (Cu + Co)` where Cu = cost of under-ordering (lost margin) 
-    and Co = cost of over-ordering (markdown loss).
 
-    **Step 2 — Base commitment:** You lock in the base order early (long lead time). This covers expected 
-    demand at low cost, but you're exposed to demand volatility.
+    **Step 1 — Corrected newsvendor for base supplier:** In a dual-source model, under-ordering 
+    from base doesn't lose the sale — the surge supplier catches it. So the base Cu = `surge cost − base cost` 
+    (just the premium paid), not the full lost margin. Co = `base cost − salvage + holding cost`. 
+    This keeps the base commitment deliberately conservative.
 
-    **Step 3 — Surge fill:** As the selling season approaches, demand uncertainty resolves. The surge supplier 
-    covers the gap between your base commitment and your target service level — but at a premium. The model 
-    sweeps every possible service level target and finds where the surge premium is no longer worth the 
-    additional stockout risk it hedges.
+    **Step 2 — Surge supplier uses conventional newsvendor:** Since surge is the last resort, 
+    a stockout there IS a genuine lost sale. Cu = `price − surge cost`, Co = `surge cost − salvage + holding cost`.
 
-    **Step 4 — Output:** The optimal split, a profit curve, and the full demand distribution showing exactly 
-    what each supplier is covering.
+    **Step 3 — Base commitment is locked in early** (long lead time). Surge fills the gap between 
+    the base commit and your target service level as demand uncertainty resolves closer to the selling period.
+
+    **Step 4 — The model sweeps every service level** from 50–99.9% and finds where the surge 
+    premium stops being worth the additional stockout risk it hedges — that's your optimal split.
+
+    **Step 5 — Holding costs** are applied to expected leftover inventory and included in both 
+    Co calculations, so over-ordering is penalised not just by markdown loss but by the capital 
+    cost of carrying that stock through the period.
     """)
