@@ -20,7 +20,7 @@ st.markdown(
 with st.sidebar:
     st.header("📦 Product Economics")
     selling_price = st.number_input("Selling Price (£)", value=60.0, step=1.0)
-    salvage_value = st.number_input("Salvage / Markdown Value (£)", value=10.0, step=1.0,
+    salvage_value = st.number_input("Salvage / Markdown Value (£)", value=15.0, step=1.0,
                                     help="What you recover per unit if you over-order and discount unsold stock.")
     alpha = st.slider("Inventory Carry-Forward (%)", 0, 100, 70,
                       help="Percent of leftover inventory expected to sell later at full price (Shelf Life Factor). Higher % = Lower overage cost.") / 100.0
@@ -36,14 +36,14 @@ with st.sidebar:
 
     st.markdown("---")
     st.header("🏭 Base Supplier (Cheap, Slow)")
-    base_cost = st.number_input("Unit Cost — Base (£)", value=18.0, step=0.5)
-    base_lead_time = st.number_input("Lead Time — Base (weeks)", value=10, step=1)
+    base_cost = st.number_input("Unit Cost — Base (£)", value=20.0, step=0.5)
+    base_lead_time = st.number_input("Lead Time — Base (weeks)", value=12, step=1)
     base_moq = st.number_input("MOQ — Base (units)", value=500, step=100,
                                 help="Minimum Order Quantity. Base suppliers often carry high MOQs.")
 
     st.markdown("---")
     st.header("⚡ Surge Supplier (Expensive, Fast)")
-    surge_cost = st.number_input("Unit Cost — Surge (£)", value=28.0, step=0.5)
+    surge_cost = st.number_input("Unit Cost — Surge (£)", value=22.0, step=0.5)
     surge_lead_time = st.number_input("Lead Time — Surge (weeks)", value=2, step=1)
     surge_moq = st.number_input("MOQ — Surge (units)", value=100, step=50,
                                  help="Surge suppliers are typically more flexible on minimums.")
@@ -84,16 +84,15 @@ def expected_metrics(q, mu, sigma):
     return exp_sales, exp_leftover, exp_stockout
 
 
-def newsvendor_base(salvage, base_cost, surge_cost, mu, sigma, holding_per_period, price, alpha):
+def newsvendor_base(salvage, base_cost, surge_cost, mu, sigma, holding_per_period, alpha):
     """
     Base supplier in a dual-source model.
-    Cu = surge_cost - base_cost
-    Co = holding_per_period + (1 - alpha) * (base_cost - salvage)
-         Overage considers carry-forward (shelf life). You only take the 
-         markdown hit on the inventory you CANNOT carry forward.
+    The economic value of a carried-forward unit is its REPLACEMENT COST (base_cost),
+    not the selling price.
     """
+    effective_salvage = (alpha * base_cost) + ((1.0 - alpha) * salvage)
     cu = surge_cost - base_cost
-    co = holding_per_period + (1.0 - alpha) * (base_cost - salvage)
+    co = (base_cost - effective_salvage) + holding_per_period
     
     if (cu + co) <= 0:
         return None
@@ -105,14 +104,16 @@ def newsvendor_base(salvage, base_cost, surge_cost, mu, sigma, holding_per_perio
                 exp_sales=exp_sales, exp_leftover=exp_leftover, exp_stockout=exp_stockout)
 
 
-def newsvendor_surge(price, salvage, surge_cost, mu, sigma, holding_per_period, alpha):
+def newsvendor_surge(price, salvage, base_cost, surge_cost, mu, sigma, holding_per_period, alpha):
     """
     Surge supplier — last resort.
-    Cu = price - surge_cost   (full lost margin)
-    Co = holding_per_period + (1 - alpha) * (surge_cost - salvage)
+    Even if a surge unit is carried forward, you only save the cheapest replacement cost (base_cost).
     """
+    effective_salvage = (alpha * base_cost) + ((1.0 - alpha) * salvage)
+    surge_hold = (surge_cost / base_cost) * holding_per_period
+    
     cu = price - surge_cost
-    co = holding_per_period + (1.0 - alpha) * (surge_cost - salvage)
+    co = (surge_cost - effective_salvage) + surge_hold
     
     if (cu + co) <= 0:
         return None
@@ -130,14 +131,12 @@ def dual_source_sweep(price, salvage, mu, sigma, base_cost, surge_cost,
                        base_moq, surge_moq, holding_per_period, q_base_fixed, alpha):
     """
     Sweep target service levels 50–99.9%. Base Q is fixed. Surge fills the gap.
-    Expected sales computed via exact normal loss function at each total Q.
-    Holding cost applied proportionally to expected leftover from each supplier.
     """
     results = []
     surge_holding_per_period = (surge_cost / base_cost) * holding_per_period
     
-    # NEW: Calculate the true economic value of leftover stock based on shelf life
-    effective_salvage = salvage + alpha * (price - salvage)
+    # Calculate the true economic replacement value of leftover stock
+    effective_salvage = (alpha * base_cost) + ((1.0 - alpha) * salvage)
 
     for pct in np.arange(0.50, 0.999, 0.005):
         q_target    = mu + stats.norm.ppf(pct) * sigma
@@ -152,8 +151,6 @@ def dual_source_sweep(price, salvage, mu, sigma, base_cost, surge_cost,
         surge_leftover = exp_leftover * (1.0 - base_frac)
 
         revenue     = price * exp_sales
-        
-        # FIXED: Use effective_salvage so the profit curve respects your shelf-life slider
         salvage_rev = effective_salvage * exp_leftover 
         
         base_spend  = base_cost * q_base_fixed
@@ -192,8 +189,8 @@ if run:
         st.error("Selling price must be above the surge unit cost.")
         st.stop()
 
-    nv_base  = newsvendor_base(salvage_value, base_cost, surge_cost, mean_demand, sigma, holding_per_period, selling_price, alpha)
-    nv_surge = newsvendor_surge(selling_price, salvage_value, surge_cost, mean_demand, sigma, holding_per_period, alpha)
+    nv_base  = newsvendor_base(salvage_value, base_cost, surge_cost, mean_demand, sigma, holding_per_period, alpha)
+    nv_surge = newsvendor_surge(selling_price, salvage_value, base_cost, surge_cost, mean_demand, sigma, holding_per_period, alpha)
 
     if not nv_base or not nv_surge:
         st.error("Check inputs — verify costs are valid relative to price and salvage.")
@@ -202,8 +199,8 @@ if run:
     q_base_fixed = max(float(base_moq), nv_base["optimal_q"]) if nv_base["optimal_q"] >= base_moq else float(base_moq)
 
     df_sweep = dual_source_sweep(selling_price, salvage_value, mean_demand, sigma,
-        base_cost, surge_cost, base_moq, surge_moq,
-        holding_per_period, q_base_fixed, alpha) # <-- Added alpha here
+                                  base_cost, surge_cost, base_moq, surge_moq,
+                                  holding_per_period, q_base_fixed, alpha)
 
     best_idx = df_sweep["Exp. Profit (£)"].idxmax()
     best     = df_sweep.loc[best_idx]
@@ -212,7 +209,7 @@ if run:
     st.markdown("---")
     st.subheader("🎯 Optimal Dual-Source Split")
     k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("Total Service Level",   f"{best['Service Level (%)']:.0f}%",
+    k1.metric("Total Service Level",   f"{best['Service Level (%)']:.1f}%",
               help="Combined coverage from base + surge against the demand distribution.")
     k2.metric("Base Order (units)",    f"{int(best['Q Base']):,}")
     k3.metric("Surge Order (units)",   f"{int(best['Q Surge']):,}",
@@ -250,7 +247,7 @@ if run:
             name="Base Units (fixed)", line=dict(color="#10b981", width=2, dash="dot")
         ), secondary_y=True)
         fig.add_vline(x=best["Service Level (%)"], line_dash="dash", line_color="red",
-                      annotation_text=f"Optimum: {best['Service Level (%)']:.0f}%",
+                      annotation_text=f"Optimum: {best['Service Level (%)']:.1f}%",
                       annotation_position="top right")
         fig.update_layout(
             title="Expected Profit vs. Total Target Service Level (base + surge combined)",
@@ -265,7 +262,7 @@ if run:
         st.markdown("#### Cost Decomposition at Optimal Split")
         c1, c2 = st.columns(2)
         with c1:
-            markdown_cost = max(0, int(best["Exp. Leftover (units)"]) * (base_cost - salvage_value))
+            markdown_cost = max(0, int(best["Exp. Leftover (units)"]) * (base_cost - salvage_value) * (1.0 - alpha))
             fig_pie = go.Figure(go.Pie(
                 labels=["Base Supplier Spend", "Surge Supplier Spend", "Expected Markdowns", "Holding Cost"],
                 values=[best["Base Spend (£)"], best["Surge Spend (£)"], markdown_cost, best["Holding Cost (£)"]],
@@ -306,8 +303,8 @@ if run:
                     f"- Unit Cost: **£{base_cost:.2f}**\n"
                     f"- **Cu** = surge cost − base cost = **£{nv_base['cu']:.2f}**/unit  \n"
                     f"  *(under-ordering from base only triggers the surge premium — the sale is not lost)*\n"
-                    f"- **Co** = base cost − effective salvage + holding = **£{nv_base['co']:.2f}**/unit  \n"
-                    f"  *(Includes £{holding_per_period:.2f} holding over {base_lead_time} weeks and shelf-life carry-forward)*\n"
+                    f"- **Co** = holding + discounted markdown risk = **£{nv_base['co']:.2f}**/unit  \n"
+                    f"  *(Includes £{holding_per_period:.2f} holding and applies the £{base_cost - salvage_value:.2f} markdown loss to only the {100 - int(alpha*100)}% of stock not carried forward)*\n"
                     f"- Critical Ratio: **{nv_base['critical_ratio']:.3f}** → commit to **{nv_base['critical_ratio']*100:.1f}th percentile**\n"
                     f"- Z-score: **{nv_base['z_score']:.3f}**\n"
                     f"- Newsvendor Optimal Q: **{int(nv_base['optimal_q']):,} units**\n"
@@ -321,8 +318,8 @@ if run:
                     f"- Unit Cost: **£{surge_cost:.2f}**\n"
                     f"- **Cu** = price − surge cost = **£{nv_surge['cu']:.2f}**/unit  \n"
                     f"  *(surge is last resort — a stockout here is a genuine lost sale)*\n"
-                    f"- **Co** = surge cost − effective salvage + holding = **£{nv_surge['co']:.2f}**/unit  \n"
-                    f"  *(Includes holding cost and shelf-life carry-forward)*\n"
+                    f"- **Co** = holding + discounted markdown risk = **£{nv_surge['co']:.2f}**/unit  \n"
+                    f"  *(Includes £{surge_hold:.2f} holding and the same discounted markdown risk)*\n"
                     f"- Critical Ratio: **{nv_surge['critical_ratio']:.3f}** → target **{nv_surge['critical_ratio']*100:.1f}th percentile**\n"
                     f"- Z-score: **{nv_surge['z_score']:.3f}**\n"
                     f"- Standalone Optimal Q: **{int(nv_surge['optimal_q']):,} units**\n"
