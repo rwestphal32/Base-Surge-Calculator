@@ -176,9 +176,9 @@ else:
 
     # Fixed Baseline Parameters for the lesson
     l_price, l_salvage, l_mean, l_base_cost = 60.0, 15.0, 1000, 20.0
-    l_holding = 1.85 # Simplified fixed holding cost for the lesson
+    l_holding_pct = 0.20 # 20% WACC
 
-    t1, t2, t3, t4 = st.tabs(["1. The Dilemma", "2. The Hedge", "3. The Lifecycle", "4. The Bottom Line"])
+    t1, t2, t3, t4, t5 = st.tabs(["1. The Dilemma", "2. The Hedge", "3. The Lifecycle", "4. The Bottom Line", "5. The Lead Time Trap 🚨"])
 
     with t1:
         st.subheader("Step 1: The Problem with Forecasting")
@@ -205,14 +205,14 @@ else:
 
         c1, c2 = st.columns(2)
         base_cu = l_surge_cost - l_base_cost
-        base_co = (l_base_cost - l_salvage) + l_holding
+        base_co = (l_base_cost - l_salvage) + 1.85
         with c1:
             st.markdown("### 🏭 Base Supplier")
             st.metric("Cost of Under-ordering (Cu)", f"£{base_cu:.2f}", help="If you order too little from Base, you don't lose the sale! You just pay the Surge premium.")
             st.metric("Cost of Over-ordering (Co)", f"£{base_co:.2f}", help="Markdown loss + Holding cost")
         
         surge_cu = l_price - l_surge_cost
-        surge_co = (l_surge_cost - l_salvage) + l_holding
+        surge_co = (l_surge_cost - l_salvage) + 1.85
         with c2:
             st.markdown("### ⚡ Surge Supplier")
             st.metric("Cost of Under-ordering (Cu)", f"£{surge_cu:.2f}", help="If you order too little from Surge, you stock out and lose the entire profit margin.")
@@ -226,9 +226,8 @@ else:
         
         l_scenario = st.radio("Product Lifecycle Scenario", ["End of Life (Sunset)", "FMCG (Risk of Obsolescence)", "Shelf-Stable (Ongoing)"], index=0, key="l_scen")
         
-        # Calculate optimal Qs to shade the curve
-        nv_b = newsvendor_base(l_salvage, l_base_cost, l_surge_cost, l_mean, l_sigma, l_holding, l_scenario)
-        nv_s = newsvendor_surge(l_price, l_salvage, l_base_cost, l_surge_cost, l_mean, l_sigma, l_holding, l_scenario)
+        nv_b = newsvendor_base(l_salvage, l_base_cost, l_surge_cost, l_mean, l_sigma, 1.85, l_scenario)
+        nv_s = newsvendor_surge(l_price, l_salvage, l_base_cost, l_surge_cost, l_mean, l_sigma, 1.85, l_scenario)
         q_b, q_t = int(nv_b['optimal_q']), int(nv_s['optimal_q'])
 
         c3, c4 = st.columns([1, 2])
@@ -254,8 +253,7 @@ else:
         st.subheader("Step 4: The Bottom Line")
         st.markdown("By calculating the Expected Profit across every possible service level, we can map out the financial frontier. The peak of this curve is your mathematical optimum.")
         
-        # Run a sweep using the learned variables
-        df_l_sweep = dual_source_sweep(l_price, l_salvage, l_mean, l_sigma, l_base_cost, l_surge_cost, 0, 0, l_holding, q_b, l_scenario)
+        df_l_sweep = dual_source_sweep(l_price, l_salvage, l_mean, l_sigma, l_base_cost, l_surge_cost, 0, 0, 1.85, q_b, l_scenario)
         l_best = df_l_sweep.loc[df_l_sweep["Exp. Profit (£)"].idxmax()]
         
         fig4 = make_subplots(specs=[[{"secondary_y": True}]])
@@ -263,5 +261,47 @@ else:
         fig4.add_vline(x=l_best["Service Level (%)"], line_dash="dash", line_color="red", annotation_text=f"Max Profit at {l_best['Service Level (%)']:.1f}%")
         fig4.update_layout(height=400, template="plotly_white", xaxis_title="Target Service Level (%)", yaxis_title="Expected Profit (£)")
         st.plotly_chart(fig4, use_container_width=True)
+
+    with t5:
+        st.subheader("Step 5: Working Capital & The Bullwhip Effect")
+        st.markdown("For an MBA, lead time isn't just a supply chain metric—it's a massive financial lever. Longer lead times do two destructive things: they trap working capital (destroying ROCE), and they exponentially amplify the **Bullwhip Effect**.")
         
-        st.success("🎉 You've mastered the math! You can now switch back to **Pro Mode** in the sidebar to run custom numbers for your own business cases.")
+        l_lead_time = st.slider("Base Supplier Lead Time (Weeks)", 2, 24, 12, key="l_lt_mba")
+        
+        # Financial Math based on Little's Law
+        weekly_demand = l_mean / 12.0 # Assuming 1000 units over a 12-week season/quarter
+        pipeline_units = weekly_demand * l_lead_time
+        working_capital = pipeline_units * l_base_cost
+        cost_of_capital = working_capital * (l_holding_pct * (l_lead_time/52.0))
+        
+        st.markdown("#### 💰 Financial Impact: The Pipeline Cash Trap")
+        st.markdown("*Assume an average demand rate of ~83 units/week and a 20% Annual Cost of Capital (WACC).*")
+        col_f1, col_f2, col_f3 = st.columns(3)
+        col_f1.metric("Units in Transit (Pipeline)", f"{int(pipeline_units):,} units")
+        col_f2.metric("Working Capital Tied Up", f"£{int(working_capital):,}")
+        col_f3.metric("Opportunity Cost of Capital", f"£{int(cost_of_capital):,}")
+
+        st.markdown("---")
+        st.markdown("#### 🌊 The Bullwhip Effect Simulator")
+        st.markdown("What happens if customer demand suddenly spikes by **20% in Week 4**? With a 2-week lead time, you just order 20% more. But with a long lead time, you have to order enough to cover the spike *for the entire lead time horizon* to refill your pipeline. This creates a massive phantom order.")
+        
+        # Bullwhip Math
+        weeks = np.arange(1, 15)
+        actual_demand = [100]*3 + [120]*11 # 20% spike at week 4
+        
+        order_qty = []
+        for i, d in enumerate(actual_demand):
+            if i == 3: # The spike
+                # Panic order: The new demand + adjusting the pipeline safety stock over the lead time
+                panic_spike = d + ((d - 100) * l_lead_time)
+                order_qty.append(panic_spike)
+            else:
+                order_qty.append(d)
+                
+        fig_bw = go.Figure()
+        fig_bw.add_trace(go.Scatter(x=weeks, y=actual_demand, name="Actual Customer Demand", line=dict(color="#10b981", width=3)))
+        fig_bw.add_trace(go.Scatter(x=weeks, y=order_qty, name="Your Order to Supplier", line=dict(color="#ef4444", width=3, dash="dash")))
+        fig_bw.update_layout(height=350, template="plotly_white", yaxis_title="Units", xaxis_title="Week", yaxis_range=[0, max(order_qty)+50])
+        st.plotly_chart(fig_bw, use_container_width=True)
+        
+        st.error("💡 **Takeaway:** Move the slider to 20 weeks. Look at the red spike. Long lead times force your supply chain to violently overreact to small changes in demand, leading to massive excess inventory arriving just as the demand spike fades.")
