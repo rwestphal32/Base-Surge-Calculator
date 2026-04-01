@@ -30,6 +30,26 @@ def calculate_overage_cost(cost, salvage, holding, scenario):
     else: # "Shelf-Stable (Ongoing)"
         return holding
 
+# NEW: Calculates profit if we only use ONE supplier
+def calc_standalone(price, salvage, cost, mu, sigma, holding_per_period, scenario):
+    cu = price - cost
+    co = calculate_overage_cost(cost, salvage, holding_per_period, scenario)
+    if (cu + co) <= 0: return 0, 0
+    cr = cu / (cu + co)
+    z = stats.norm.ppf(cr)
+    q = max(0.0, mu + z * sigma)
+    exp_sales, exp_leftover, exp_stockout = expected_metrics(q, mu, sigma)
+    
+    revenue = price * exp_sales
+    if scenario == "End of Life (Sunset)": salvage_rev = salvage * exp_leftover
+    elif scenario == "FMCG (Risk of Obsolescence)": salvage_rev = (salvage * 0.5 * exp_leftover) + (cost * 0.5 * exp_leftover)
+    else: salvage_rev = cost * exp_leftover
+    
+    spend = cost * q
+    hold_cost = holding_per_period * exp_leftover
+    exp_profit = revenue + salvage_rev - spend - hold_cost
+    return q, exp_profit
+
 def newsvendor_base(salvage, base_cost, surge_cost, mu, sigma, holding_per_period, scenario):
     cu = surge_cost - base_cost
     co = calculate_overage_cost(base_cost, salvage, holding_per_period, scenario)
@@ -84,6 +104,7 @@ def dual_source_sweep(price, salvage, mu, sigma, base_cost, surge_cost, base_moq
             "Base Spend (£)": round(base_spend), "Surge Spend (£)": round(surge_spend),
             "Holding Cost (£)": round(hold_cost), "Exp. Leftover (units)": round(exp_leftover),
             "Exp. Stockout (units)": round(exp_stockout), "Exp. Profit (£)": round(exp_profit),
+            "Exp. Sales Total": exp_sales
         })
     return pd.DataFrame(results)
 
@@ -138,16 +159,33 @@ if app_mode == "🚀 Pro Mode (Dashboard)":
         df_sweep = dual_source_sweep(selling_price, salvage_value, mean_demand, sigma, base_cost, surge_cost, base_moq, surge_moq, holding_per_period, q_base_fixed, scenario)
         best = df_sweep.loc[df_sweep["Exp. Profit (£)"].idxmax()]
 
+        # Calculate Standalone options for comparison
+        base_q_only, base_profit_only = calc_standalone(selling_price, salvage_value, base_cost, mean_demand, sigma, holding_per_period, scenario)
+        surge_hold = (surge_cost / base_cost) * holding_per_period
+        surge_q_only, surge_profit_only = calc_standalone(selling_price, salvage_value, surge_cost, mean_demand, sigma, surge_hold, scenario)
+
         st.subheader(f"🎯 Optimal Split: {scenario}")
         k1, k2, k3, k4 = st.columns(4)
         k1.metric("Total Target Service Level", f"{best['Service Level (%)']:.1f}%")
         k2.metric("Base Order", f"{int(best['Q Base']):,}")
         k3.metric("Surge Order", f"{int(best['Q Surge']):,}")
-        k4.metric("Expected Profit", f"£{int(best['Exp. Profit (£)']):,}")
+        k4.metric("Dual-Source Profit", f"£{int(best['Exp. Profit (£)']):,}")
 
         t1, t2, t3, t4 = st.tabs(["📈 Financials & Profit Curve", "⚙️ Newsvendor Mechanics", "📐 Demand Distribution", "📋 Raw Data Sweep"])
         
         with t1:
+            st.markdown("#### Strategy Comparison: Expected Profit")
+            st.markdown("Is the complexity of managing two suppliers worth the money? Here is the expected profit of the dual-sourcing strategy compared to relying exclusively on a single supplier.")
+            
+            sc1, sc2, sc3 = st.columns(3)
+            best_single = max(base_profit_only, surge_profit_only)
+            value_add = best['Exp. Profit (£)'] - best_single
+            
+            sc1.metric("Base Supplier Only", f"£{int(base_profit_only):,}", help=f"Optimal Q if only using Base: {int(base_q_only)}")
+            sc2.metric("Surge Supplier Only", f"£{int(surge_profit_only):,}", help=f"Optimal Q if only using Surge: {int(surge_q_only)}")
+            sc3.metric("Dual Sourcing (Optimal)", f"£{int(best['Exp. Profit (£)']):,}", delta=f"+£{int(value_add):,} vs single source")
+
+            st.markdown("---")
             c_chart, c_pie = st.columns([2, 1])
             with c_chart:
                 fig = make_subplots(specs=[[{"secondary_y": True}]])
@@ -170,13 +208,16 @@ if app_mode == "🚀 Pro Mode (Dashboard)":
                 fig_pie.update_layout(title="Cost Breakdown at Optimum", height=400, margin=dict(l=0,r=0,t=30,b=0), template="plotly_white")
                 st.plotly_chart(fig_pie, use_container_width=True)
                 
-            st.markdown("#### Financial Value of the Hedge")
+            st.markdown("#### Show Your Work: Financial Value of the Surge Hedge")
             c_f1, c_f2, c_f3 = st.columns(3)
-            surge_premium_paid = int(best["Q Surge"]) * (surge_cost - base_cost)
-            unhedged_exposure = int(nv_base["exp_stockout"]) * (surge_cost - base_cost)
-            c_f1.metric("Surge Premium Paid", f"£{surge_premium_paid:,}", help="Incremental cost paid to Surge supplier over Base cost.")
-            c_f2.metric("Unhedged Surge Exposure", f"£{unhedged_exposure:,}", help="What you'd pay in emergency surge premiums if you relied ONLY on the base order.")
-            c_f3.metric("Net Benefit of Pre-Ordering Surge", f"£{unhedged_exposure - surge_premium_paid:,}")
+            expected_surge_sales = best["Exp. Sales Total"] - nv_base["exp_sales"]
+            surge_investment = int(best["Q Surge"]) * surge_cost
+            revenue_protected = int(expected_surge_sales) * selling_price
+            net_surge_margin = revenue_protected - surge_investment
+            
+            c_f1.metric("Surge Investment (Cost)", f"£{surge_investment:,}", help="Total capital spent on the fast, reactive supplier.")
+            c_f2.metric("Revenue Protected (Benefit)", f"£{revenue_protected:,}", help="Expected top-line revenue captured that would have been lost as stockouts without the Surge supplier.")
+            c_f3.metric("Net Margin Added", f"£{net_surge_margin:,}", help="The absolute bottom-line profit generated purely by utilizing the Surge supplier.")
 
         with t2:
             st.markdown("The underlying math calculates the optimal service level (Critical Ratio) by balancing the **Cost of Under-ordering ($C_u$)** against the **Cost of Over-ordering ($C_o$)**.")
@@ -344,17 +385,39 @@ else:
         st.info("💡 **Takeaway:** When inventory doesn't spoil (Shelf-Stable), the penalty for over-ordering drops to almost zero. The model shifts the green area to the right, telling you to buy almost everything from the cheap Base supplier.")
 
     with t5:
-        st.subheader("Step 5: The Bottom Line (Target Service Level)")
-        st.markdown("**Target Service Level** isn't an arbitrary goal set by management (e.g., \"We must hit 99% fulfillment\"). In supply chain finance, Service Level is a mathematical output. It is the exact probability of *not* stocking out that maximizes your expected profit.")
-        st.markdown("By calculating the Expected Profit across every possible probability, we map out the financial frontier. The absolute peak of this curve is your optimal Service Level.")
+        st.subheader("Step 5: The Bottom Line (Profit & Strategy)")
+        st.markdown("**Target Service Level** isn't an arbitrary goal set by management. It is a mathematical output—the exact probability of *not* stocking out that maximizes your expected profit.")
+        st.markdown("Is dual sourcing actually worth the complexity? Compare the peak of the profit curve below with the single-source alternatives.")
         
         df_l_sweep = dual_source_sweep(l_price, l_salvage, l_mean, l_sigma, l_base_cost, l_surge_cost, 0, 0, 1.85, q_b, l_scenario)
         l_best = df_l_sweep.loc[df_l_sweep["Exp. Profit (£)"].idxmax()]
         
+        # Standalone comparison for learning tab
+        l_base_q_only, l_base_profit = calc_standalone(l_price, l_salvage, l_base_cost, l_mean, l_sigma, 1.85, l_scenario)
+        l_surge_hold = (l_surge_cost / l_base_cost) * 1.85
+        l_surge_q_only, l_surge_profit = calc_standalone(l_price, l_salvage, l_surge_cost, l_mean, l_sigma, l_surge_hold, l_scenario)
+        
+        sc1, sc2, sc3 = st.columns(3)
+        l_best_single = max(l_base_profit, l_surge_profit)
+        l_value_add = l_best['Exp. Profit (£)'] - l_best_single
+        sc1.metric("Base Supplier Only", f"£{int(l_base_profit):,}")
+        sc2.metric("Surge Supplier Only", f"£{int(l_surge_profit):,}")
+        sc3.metric("Dual Sourcing", f"£{int(l_best['Exp. Profit (£)']):,}", delta=f"+£{int(l_value_add):,} value added")
+
         fig4 = make_subplots(specs=[[{"secondary_y": True}]])
         fig4.add_trace(go.Scatter(x=df_l_sweep["Service Level (%)"], y=df_l_sweep["Exp. Profit (£)"], name="Expected Profit (£)", line=dict(color="#2563eb", width=3)), secondary_y=False)
         fig4.add_vline(x=l_best["Service Level (%)"], line_dash="dash", line_color="red", annotation_text=f"Max Profit at {l_best['Service Level (%)']:.1f}%")
         fig4.update_layout(height=400, template="plotly_white", xaxis_title="Target Service Level (%)", yaxis_title="Expected Profit (£)")
         st.plotly_chart(fig4, use_container_width=True)
         
+        st.markdown("#### Show Your Work: Value of the Surge Hedge")
+        c_f1, c_f2, c_f3 = st.columns(3)
+        expected_surge_sales = l_best["Exp. Sales Total"] - nv_b["exp_sales"]
+        surge_investment = int(l_best["Q Surge"]) * l_surge_cost
+        revenue_protected = int(expected_surge_sales) * l_price
+        net_surge_margin = revenue_protected - surge_investment
+        c_f1.metric("Surge Investment (Cost)", f"£{surge_investment:,}")
+        c_f2.metric("Revenue Protected (Benefit)", f"£{revenue_protected:,}")
+        c_f3.metric("Net Margin Added", f"£{net_surge_margin:,}")
+
         st.success("🎉 You've mastered the math! You can now switch back to **Pro Mode** in the sidebar to run custom numbers for your own business cases.")
