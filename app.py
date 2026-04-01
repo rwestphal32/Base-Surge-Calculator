@@ -4,11 +4,12 @@ import numpy as np
 import scipy.stats as stats
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import math
 
 st.set_page_config(page_title="Dual Sourcing Optimizer", layout="wide")
 
 # ─────────────────────────────────────────────
-# CORE NEWSVENDOR MATH (Shared by both modes)
+# CORE NEWSVENDOR MATH (Variance Reduction Enabled)
 # ─────────────────────────────────────────────
 def expected_metrics(q, mu, sigma):
     if sigma <= 0:
@@ -30,7 +31,6 @@ def calculate_overage_cost(cost, salvage, holding, scenario):
     else: # "Shelf-Stable (Ongoing)"
         return holding
 
-# NEW: Calculates profit if we only use ONE supplier
 def calc_standalone(price, salvage, cost, mu, sigma, holding_per_period, scenario):
     cu = price - cost
     co = calculate_overage_cost(cost, salvage, holding_per_period, scenario)
@@ -50,40 +50,35 @@ def calc_standalone(price, salvage, cost, mu, sigma, holding_per_period, scenari
     exp_profit = revenue + salvage_rev - spend - hold_cost
     return q, exp_profit
 
-def newsvendor_base(salvage, base_cost, surge_cost, mu, sigma, holding_per_period, scenario):
+def newsvendor_base(salvage, base_cost, surge_cost, mu, sigma_base, holding_per_period, scenario):
     cu = surge_cost - base_cost
     co = calculate_overage_cost(base_cost, salvage, holding_per_period, scenario)
     if (cu + co) <= 0: return None
     cr = cu / (cu + co)
     z  = stats.norm.ppf(cr)
-    q  = max(0.0, mu + z * sigma)
-    exp_sales, exp_leftover, exp_stockout = expected_metrics(q, mu, sigma)
-    return dict(cu=cu, co=co, critical_ratio=cr, z_score=z, optimal_q=q,
-                exp_sales=exp_sales, exp_leftover=exp_leftover, exp_stockout=exp_stockout)
+    q  = max(0.0, mu + z * sigma_base)
+    return dict(cu=cu, co=co, critical_ratio=cr, z_score=z, optimal_q=q)
 
-def newsvendor_surge(price, salvage, base_cost, surge_cost, mu, sigma, holding_per_period, scenario):
-    surge_hold = (surge_cost / base_cost) * holding_per_period
+def newsvendor_surge(price, salvage, base_cost, surge_cost, mu, sigma_surge, surge_hold, scenario):
     cu = price - surge_cost
     co = calculate_overage_cost(surge_cost, salvage, surge_hold, scenario)
     if (cu + co) <= 0: return None
     cr = cu / (cu + co)
     z  = stats.norm.ppf(cr)
-    q  = max(0.0, mu + z * sigma)
-    exp_sales, exp_leftover, exp_stockout = expected_metrics(q, mu, sigma)
-    exp_profit = (price * exp_sales) + (salvage * exp_leftover) - (surge_cost * q) - (holding_per_period * exp_leftover)
-    return dict(cu=cu, co=co, critical_ratio=cr, z_score=z, optimal_q=q,
-                exp_sales=exp_sales, exp_leftover=exp_leftover, exp_stockout=exp_stockout, exp_profit=exp_profit)
+    q  = max(0.0, mu + z * sigma_surge)
+    return dict(cu=cu, co=co, critical_ratio=cr, z_score=z, optimal_q=q)
 
-def dual_source_sweep(price, salvage, mu, sigma, base_cost, surge_cost, base_moq, surge_moq, holding_per_period, q_base_fixed, scenario):
+def dual_source_sweep(price, salvage, mu, sigma_surge, base_cost, surge_cost, base_hold, surge_hold, q_base_fixed, scenario):
     results = []
-    surge_holding_per_period = (surge_cost / base_cost) * holding_per_period
     for pct in np.arange(0.50, 0.999, 0.005):
-        q_target = mu + stats.norm.ppf(pct) * sigma
-        q_surge_raw = max(0.0, q_target - q_base_fixed)
-        q_surge = max(float(surge_moq), q_surge_raw) if q_surge_raw >= surge_moq else 0.0
+        # Target Q is generated against the HIGHLY ACCURATE Surge forecast
+        q_target = mu + stats.norm.ppf(pct) * sigma_surge
+        q_surge = max(0.0, q_target - q_base_fixed)
         q_total = q_base_fixed + q_surge
 
-        exp_sales, exp_leftover, exp_stockout = expected_metrics(q_total, mu, sigma)
+        # Outcomes are evaluated against the Surge forecast because that is when the final capacity decision is locked in
+        exp_sales, exp_leftover, exp_stockout = expected_metrics(q_total, mu, sigma_surge)
+        
         base_frac = q_base_fixed / q_total if q_total > 0 else 1.0
         base_leftover = exp_leftover * base_frac
         surge_leftover = exp_leftover * (1.0 - base_frac)
@@ -95,7 +90,7 @@ def dual_source_sweep(price, salvage, mu, sigma, base_cost, surge_cost, base_moq
         
         base_spend = base_cost * q_base_fixed
         surge_spend = surge_cost * q_surge
-        hold_cost = (holding_per_period * base_leftover) + (surge_holding_per_period * surge_leftover)
+        hold_cost = (base_hold * base_leftover) + (surge_hold * surge_leftover)
         exp_profit = revenue + salvage_rev - base_spend - surge_spend - hold_cost
 
         results.append({
@@ -116,9 +111,6 @@ app_mode = st.sidebar.radio("Select App Mode", ["🎓 Learning Mode (Concepts)",
 st.sidebar.markdown("---")
 
 if app_mode == "🚀 Pro Mode (Dashboard)":
-    # =========================================================================
-    # PRO MODE (The Full Operational Dashboard)
-    # =========================================================================
     st.title("⚖️ Dual Sourcing: Operational Optimizer")
     st.markdown("Configure your supplier economics in the sidebar to generate your optimal procurement split.")
 
@@ -126,64 +118,71 @@ if app_mode == "🚀 Pro Mode (Dashboard)":
         st.header("📦 Product Economics")
         selling_price = st.number_input("Selling Price (£)", value=60.0, step=1.0)
         salvage_value = st.number_input("Salvage / Markdown Value (£)", value=15.0, step=1.0)
-        scenario = st.radio("Lifecycle Scenario", ["Shelf-Stable (Ongoing)", "FMCG (Risk of Obsolescence)", "End of Life (Sunset)"], index=1)
+        scenario = st.radio("Lifecycle Scenario", ["Shelf-Stable (Ongoing)", "FMCG (Risk of Obsolescence)", "End of Life (Sunset)"], index=2)
         
         st.markdown("---")
         st.header("📈 Demand Profile")
         mean_demand = st.number_input("Mean Seasonal/Period Demand", value=1000, step=50)
-        volatility_pct = st.slider("Demand Volatility (CV %)", 5, 80, 25)
-        sigma = mean_demand * (volatility_pct / 100.0)
+        volatility_pct = st.slider("Base Demand Volatility (CV %)", 5, 80, 25)
+        sigma_base = mean_demand * (volatility_pct / 100.0)
         
         st.markdown("---")
         st.header("🏭 Base Supplier (Cheap, Slow)")
         base_cost = st.number_input("Unit Cost — Base (£)", value=20.0, step=0.5)
-        base_lead_time = st.number_input("Lead Time (weeks)", value=12, step=1)
+        base_lead_time = st.number_input("Lead Time (weeks)", value=12, step=1, min_value=1)
         base_moq = st.number_input("MOQ — Base (units)", value=500, step=100)
         
         st.markdown("---")
         st.header("⚡ Surge Supplier (Expensive, Fast)")
         surge_cost = st.number_input("Unit Cost — Surge (£)", value=22.0, step=0.5)
+        surge_lead_time = st.number_input("Surge Lead Time (weeks)", value=2, step=1, min_value=1)
         surge_moq = st.number_input("MOQ — Surge (units)", value=100, step=50)
         
         st.markdown("---")
         st.header("💰 Holding Cost")
         holding_cost_pct = st.slider("Annual Holding Cost / WACC (%)", 10, 40, 20) / 100.0
-        holding_per_period = ((base_cost * holding_cost_pct) / 52.0) * base_lead_time
+        
+        # Calculate holding costs per period based on lead times
+        base_holding_per_period = ((base_cost * holding_cost_pct) / 52.0) * base_lead_time
+        surge_holding_per_period = ((surge_cost * holding_cost_pct) / 52.0) * surge_lead_time
+        
+        # APPLY THE SQUARE ROOT LAW OF LEAD TIME: Volatility shrinks as lead time shortens.
+        sigma_surge = sigma_base * math.sqrt(surge_lead_time / base_lead_time)
         
         run = st.button("🚀 Run Optimizer", type="primary", use_container_width=True)
 
     if run:
-        nv_base  = newsvendor_base(salvage_value, base_cost, surge_cost, mean_demand, sigma, holding_per_period, scenario)
-        nv_surge = newsvendor_surge(selling_price, salvage_value, base_cost, surge_cost, mean_demand, sigma, holding_per_period, scenario)
-        q_base_fixed = max(float(base_moq), nv_base["optimal_q"])
-        df_sweep = dual_source_sweep(selling_price, salvage_value, mean_demand, sigma, base_cost, surge_cost, base_moq, surge_moq, holding_per_period, q_base_fixed, scenario)
-        best = df_sweep.loc[df_sweep["Exp. Profit (£)"].idxmax()]
+        # Standalone comparisons evaluated against their respective uncertainties
+        base_q_only, base_profit_only = calc_standalone(selling_price, salvage_value, base_cost, mean_demand, sigma_base, base_holding_per_period, scenario)
+        surge_q_only, surge_profit_only = calc_standalone(selling_price, salvage_value, surge_cost, mean_demand, sigma_surge, surge_holding_per_period, scenario)
 
-        # Calculate Standalone options for comparison
-        base_q_only, base_profit_only = calc_standalone(selling_price, salvage_value, base_cost, mean_demand, sigma, holding_per_period, scenario)
-        surge_hold = (surge_cost / base_cost) * holding_per_period
-        surge_q_only, surge_profit_only = calc_standalone(selling_price, salvage_value, surge_cost, mean_demand, sigma, surge_hold, scenario)
+        nv_base = newsvendor_base(salvage_value, base_cost, surge_cost, mean_demand, sigma_base, base_holding_per_period, scenario)
+        nv_surge = newsvendor_surge(selling_price, salvage_value, base_cost, surge_cost, mean_demand, sigma_surge, surge_holding_per_period, scenario)
+        
+        q_base_fixed = max(float(base_moq), nv_base["optimal_q"])
+            
+        df_sweep = dual_source_sweep(selling_price, salvage_value, mean_demand, sigma_surge, base_cost, surge_cost, base_holding_per_period, surge_holding_per_period, q_base_fixed, scenario)
+        best = df_sweep.loc[df_sweep["Exp. Profit (£)"].idxmax()]
 
         st.subheader(f"🎯 Optimal Split: {scenario}")
         k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Total Target Service Level", f"{best['Service Level (%)']:.1f}%")
+        k1.metric("Target Service Level", f"{best['Service Level (%)']:.1f}%")
         k2.metric("Base Order", f"{int(best['Q Base']):,}")
         k3.metric("Surge Order", f"{int(best['Q Surge']):,}")
-        k4.metric("Dual-Source Profit", f"£{int(best['Exp. Profit (£)']):,}")
+        k4.metric("Dual-Source Expected Profit", f"£{int(best['Exp. Profit (£)']):,}")
 
-        t1, t2, t3, t4 = st.tabs(["📈 Financials & Profit Curve", "⚙️ Newsvendor Mechanics", "📐 Demand Distribution", "📋 Raw Data Sweep"])
+        t1, t2, t3, t4 = st.tabs(["📈 Financials & Strategy", "⚙️ Newsvendor Mechanics", "📐 Demand Distribution", "📋 Raw Data"])
         
         with t1:
             st.markdown("#### Strategy Comparison: Expected Profit")
-            st.markdown("Is the complexity of managing two suppliers worth the money? Here is the expected profit of the dual-sourcing strategy compared to relying exclusively on a single supplier.")
+            st.markdown("By placing the Surge order later (with a shorter lead time), forecast volatility shrinks. This massive reduction in overage risk is what makes Dual Sourcing so profitable.")
             
             sc1, sc2, sc3 = st.columns(3)
             best_single = max(base_profit_only, surge_profit_only)
             value_add = best['Exp. Profit (£)'] - best_single
-            
             sc1.metric("Base Supplier Only", f"£{int(base_profit_only):,}", help=f"Optimal Q if only using Base: {int(base_q_only)}")
             sc2.metric("Surge Supplier Only", f"£{int(surge_profit_only):,}", help=f"Optimal Q if only using Surge: {int(surge_q_only)}")
-            sc3.metric("Dual Sourcing (Optimal)", f"£{int(best['Exp. Profit (£)']):,}", delta=f"+£{int(value_add):,} vs single source")
+            sc3.metric("Dual Sourcing (Optimal)", f"£{int(best['Exp. Profit (£)']):,}", delta=f"+£{int(value_add):,} value generated" if value_add > 1 else "0 value generated", delta_color="normal")
 
             st.markdown("---")
             c_chart, c_pie = st.columns([2, 1])
@@ -210,24 +209,29 @@ if app_mode == "🚀 Pro Mode (Dashboard)":
                 
             st.markdown("#### Show Your Work: Financial Value of the Surge Hedge")
             c_f1, c_f2, c_f3 = st.columns(3)
-            expected_surge_sales = best["Exp. Sales Total"] - nv_base["exp_sales"]
-            surge_investment = int(best["Q Surge"]) * surge_cost
-            revenue_protected = int(expected_surge_sales) * selling_price
-            net_surge_margin = revenue_protected - surge_investment
             
-            c_f1.metric("Surge Investment (Cost)", f"£{surge_investment:,}", help="Total capital spent on the fast, reactive supplier.")
-            c_f2.metric("Revenue Protected (Benefit)", f"£{revenue_protected:,}", help="Expected top-line revenue captured that would have been lost as stockouts without the Surge supplier.")
-            c_f3.metric("Net Margin Added", f"£{net_surge_margin:,}", help="The absolute bottom-line profit generated purely by utilizing the Surge supplier.")
+            if int(best["Q Surge"]) == 0:
+                expected_surge_sales, surge_investment, revenue_protected, net_surge_margin = 0, 0, 0, 0
+            else:
+                base_only_sales = expected_metrics(best["Q Base"], mean_demand, sigma_base)[0]
+                expected_surge_sales = best["Exp. Sales Total"] - base_only_sales
+                surge_investment = int(best["Q Surge"]) * surge_cost
+                revenue_protected = int(expected_surge_sales) * selling_price
+                net_surge_margin = revenue_protected - surge_investment
+            
+            c_f1.metric("Surge Investment (Cost)", f"£{surge_investment:,}", help="Total capital spent on the fast supplier.")
+            c_f2.metric("Revenue Protected (Benefit)", f"£{revenue_protected:,}", help="Expected top-line revenue captured that would have been lost without the Surge supplier.")
+            c_f3.metric("Net Margin Added", f"£{net_surge_margin:,}", help="The bottom-line profit generated purely by utilizing the Surge supplier.")
 
         with t2:
             st.markdown("The underlying math calculates the optimal service level (Critical Ratio) by balancing the **Cost of Under-ordering ($C_u$)** against the **Cost of Over-ordering ($C_o$)**.")
-            
             col1, col2 = st.columns(2)
             with col1:
                 with st.container(border=True):
                     st.markdown("### 🏭 Base Supplier")
-                    st.markdown(f"- **Cost of Under-ordering ($C_u$):** Surge Cost (£{surge_cost}) - Base Cost (£{base_cost}) = **£{nv_base['cu']:.2f}**/unit")
-                    st.markdown(f"- **Cost of Over-ordering ($C_o$):** Scenario Penalty + Holding = **£{nv_base['co']:.2f}**/unit")
+                    st.markdown(f"*(Evaluated against 12-week forecast volatility: {volatility_pct:.1f}%)*")
+                    st.markdown(f"- **$C_u$:** Surge Cost (£{surge_cost}) - Base Cost (£{base_cost}) = **£{nv_base['cu']:.2f}**/unit")
+                    st.markdown(f"- **$C_o$:** Scenario Penalty + Holding = **£{nv_base['co']:.2f}**/unit")
                     st.markdown("---")
                     st.markdown(f"**Critical Ratio ($CR_1$):** `Cu / (Cu + Co)` = **{nv_base['critical_ratio']:.3f}**")
                     st.markdown(f"**Target Z-Score:** **{nv_base['z_score']:.3f}** std deviations")
@@ -235,31 +239,29 @@ if app_mode == "🚀 Pro Mode (Dashboard)":
             with col2:
                 with st.container(border=True):
                     st.markdown("### ⚡ Surge Supplier")
-                    st.markdown(f"- **Cost of Under-ordering ($C_u$):** Price (£{selling_price}) - Surge Cost (£{surge_cost}) = **£{nv_surge['cu']:.2f}**/unit")
-                    st.markdown(f"- **Cost of Over-ordering ($C_o$):** Scenario Penalty + Holding = **£{nv_surge['co']:.2f}**/unit")
+                    surge_vol = volatility_pct * math.sqrt(surge_lead_time / base_lead_time)
+                    st.markdown(f"*(Evaluated against accurate 2-week forecast: {surge_vol:.1f}%)*")
+                    st.markdown(f"- **$C_u$:** Price (£{selling_price}) - Surge Cost (£{surge_cost}) = **£{nv_surge['cu']:.2f}**/unit")
+                    st.markdown(f"- **$C_o$:** Scenario Penalty + Holding = **£{nv_surge['co']:.2f}**/unit")
                     st.markdown("---")
                     st.markdown(f"**Critical Ratio ($CR_2$):** `Cu / (Cu + Co)` = **{nv_surge['critical_ratio']:.3f}**")
                     st.markdown(f"**Target Z-Score:** **{nv_surge['z_score']:.3f}** std deviations")
-                    st.markdown(f"**Total Optimal $Q_2$:** **{int(nv_surge['optimal_q']):,} units**")
+                    st.markdown(f"**Total Optimal Target $Q_2$:** **{int(nv_surge['optimal_q']):,} units**")
 
         with t3:
-            x = np.linspace(mean_demand - 4*sigma, mean_demand + 4*sigma, 600)
-            y_pdf = stats.norm.pdf(x, mean_demand, sigma)
+            x = np.linspace(mean_demand - 4*sigma_base, mean_demand + 4*sigma_base, 600)
+            y_pdf_base = stats.norm.pdf(x, mean_demand, sigma_base)
+            y_pdf_surge = stats.norm.pdf(x, mean_demand, sigma_surge)
+            
             fig2 = go.Figure()
-            m_base = x <= int(best["Q Base"])
-            m_surge = (x > int(best["Q Base"])) & (x <= int(best["Q Total"]))
-            m_stock = x > int(best["Q Total"])
+            # Base distribution
+            fig2.add_trace(go.Scatter(x=x, y=y_pdf_base, mode='lines', line=dict(color='#10b981', dash="dash"), name='Base Forecast (High Uncertainty)'))
+            # Surge distribution
+            fig2.add_trace(go.Scatter(x=x, y=y_pdf_surge, fill='tozeroy', fillcolor='rgba(37,99,235,0.1)', mode='lines', line=dict(color='#2563eb', width=2), name='Surge Forecast (Low Uncertainty)'))
             
-            fig2.add_trace(go.Scatter(x=np.concatenate([x[m_base], [int(best["Q Base"]), x[m_base][0]]]), y=np.concatenate([y_pdf[m_base], [0, 0]]), fill='toself', fillcolor='rgba(16,185,129,0.2)', line=dict(color='rgba(0,0,0,0)'), name='Base Coverage'))
-            if m_surge.any():
-                fig2.add_trace(go.Scatter(x=np.concatenate([[int(best["Q Base"])], x[m_surge], [int(best["Q Total"]), int(best["Q Base"])]]), y=np.concatenate([[0], y_pdf[m_surge], [0, 0]]), fill='toself', fillcolor='rgba(245,158,11,0.25)', line=dict(color='rgba(0,0,0,0)'), name='Surge Coverage'))
-            if m_stock.any():
-                fig2.add_trace(go.Scatter(x=np.concatenate([[int(best["Q Total"])], x[m_stock], [x[m_stock][-1], int(best["Q Total"])]]), y=np.concatenate([[0], y_pdf[m_stock], [0, 0]]), fill='toself', fillcolor='rgba(239,68,68,0.25)', line=dict(color='rgba(0,0,0,0)'), name='Stockout Risk'))
-            
-            fig2.add_trace(go.Scatter(x=x, y=y_pdf, mode='lines', line=dict(color='#1e3a5f'), name='Demand Profile'))
             fig2.add_vline(x=int(best["Q Base"]), line_dash="dash", line_color="#10b981", annotation_text="Base Order")
-            fig2.add_vline(x=int(best["Q Total"]), line_dash="dash", line_color="#f59e0b", annotation_text="Total Inventory")
-            fig2.update_layout(height=450, template="plotly_white", xaxis_title="Demand Level", yaxis_title="Probability")
+            fig2.add_vline(x=int(best["Q Total"]), line_dash="dash", line_color="#f59e0b", annotation_text="Total Inventory Target")
+            fig2.update_layout(height=450, template="plotly_white", xaxis_title="Demand Level", yaxis_title="Probability Density", title="The Value of Postponement (Shrinking the Bell Curve)")
             st.plotly_chart(fig2, use_container_width=True)
 
         with t4:
@@ -267,26 +269,20 @@ if app_mode == "🚀 Pro Mode (Dashboard)":
 
 else:
     # =========================================================================
-    # LEARNING MODE (The Guided Masterclass)
+    # LEARNING MODE
     # =========================================================================
     st.sidebar.info("🎓 **Learning Mode Active**\n\nThe complex controls have been hidden. Follow the tabs on the right to learn the mechanics of Dual Sourcing step-by-step.")
-    
     st.title("🎓 Dual Sourcing Masterclass")
-    st.markdown("Why do companies use two suppliers? Because predicting the future is impossible. We use a **cheap, slow** supplier for what we *expect* to happen, and an **expensive, fast** supplier to protect us against *surprises*.")
-
-    # Fixed Baseline Parameters for the lesson
+    
     l_price, l_salvage, l_mean, l_base_cost = 60.0, 15.0, 1000, 20.0
-    l_holding_pct = 0.20 # 20% WACC
+    l_holding_pct = 0.20 
 
-    t1, t2, t3, t4, t5 = st.tabs(["1. The Dilemma", "2. The Hedge (Cu vs Co)", "3. The Lead Time Trap 🚨", "4. The Lifecycle", "5. The Bottom Line"])
+    t1, t2, t3, t4, t5 = st.tabs(["1. The Dilemma", "2. The Hedge", "3. The Lead Time Trap 🚨", "4. The Lifecycle", "5. Strategy & Option Value"])
 
     with t1:
         st.subheader("Step 1: The Problem with Forecasting")
-        st.markdown("If you knew exactly how many units you would sell, you would order 100% of them from your cheapest factory in China. But demand is volatile. Adjust the slider below to see how uncertainty creates the need for a backup plan.")
-        
         l_volatility = st.slider("Demand Volatility (CV %)", 5, 80, 25, key="l_vol")
         l_sigma = l_mean * (l_volatility / 100.0)
-        
         x = np.linspace(200, 1800, 600)
         y_pdf = stats.norm.pdf(x, l_mean, l_sigma)
         fig1 = go.Figure()
@@ -294,130 +290,93 @@ else:
         fig1.add_vline(x=l_mean, line_dash="dash", line_color="black", annotation_text=f"Expected: {l_mean}")
         fig1.update_layout(height=350, template="plotly_white", xaxis_title="Possible Demand", yaxis_title="Probability")
         st.plotly_chart(fig1, use_container_width=True)
-        st.info("💡 **Takeaway:** The wider the curve, the riskier a single large order becomes. We need a second supplier to cover the long right tail.")
 
     with t2:
         st.subheader("Step 2: The Cost of Being Wrong (Cu vs Co)")
-        st.markdown("How much of that 'expected' demand should we commit to the Base supplier? We decide using the Newsvendor model, which weighs the **Cost of Under-ordering ($C_u$)** against the **Cost of Over-ordering ($C_o$)**.")
-        
         l_surge_cost = st.slider("Surge Supplier Premium (Unit Cost)", 20.5, 40.0, 22.0, step=0.5, key="l_surge")
-        st.markdown(f"*Base Supplier Cost is fixed at £{l_base_cost:.2f}. Selling Price is £{l_price:.2f}.*")
-
         c1, c2 = st.columns(2)
         base_cu = l_surge_cost - l_base_cost
         base_co = (l_base_cost - l_salvage) + 1.85
         base_cr = base_cu / (base_cu + base_co)
         with c1:
             st.markdown("### 🏭 Base Supplier")
-            st.metric("Cost of Under-ordering (Cu)", f"£{base_cu:.2f}", help="If you order too little from Base, you don't lose the sale! You just pay the Surge premium.")
-            st.metric("Cost of Over-ordering (Co)", f"£{base_co:.2f}", help="Markdown loss + Holding cost")
+            st.metric("Cost of Under-ordering (Cu)", f"£{base_cu:.2f}")
+            st.metric("Cost of Over-ordering (Co)", f"£{base_co:.2f}")
             st.markdown(f"**Target Probability:** `Cu / (Cu + Co)` = **{base_cr*100:.1f}%**")
-        
         surge_cu = l_price - l_surge_cost
-        surge_co = (l_surge_cost - l_salvage) + 1.85
+        surge_co = (l_surge_cost - l_salvage) + 0.30
         surge_cr = surge_cu / (surge_cu + surge_co)
         with c2:
             st.markdown("### ⚡ Surge Supplier")
-            st.metric("Cost of Under-ordering (Cu)", f"£{surge_cu:.2f}", help="If you order too little from Surge, you stock out and lose the entire profit margin.")
+            st.metric("Cost of Under-ordering (Cu)", f"£{surge_cu:.2f}")
             st.metric("Cost of Over-ordering (Co)", f"£{surge_co:.2f}")
             st.markdown(f"**Target Probability:** `Cu / (Cu + Co)` = **{surge_cr*100:.1f}%**")
 
-        st.info("💡 **Takeaway:** The formula `Cu / (Cu + Co)` is called the Critical Ratio. It dictates your Service Level. Because the penalty for under-ordering from Base is *only the surge premium*, the ratio is low, keeping your initial base order intentionally conservative.")
-
     with t3:
-        st.subheader("Step 3: The Lead Time Trap (Working Capital & Volatility)")
-        st.markdown("Why do companies care about fast shipping? Because **Lead Time equals Uncertainty**. Predicting demand 2 weeks from now is easy. Predicting demand 16 weeks from now is basically guessing. Long lead times do two destructive things: they widen your forecast error, and they trap working capital in transit pipelines.")
+        st.subheader("Step 3: The Lead Time Trap (Variance Reduction)")
+        st.markdown("Why do companies care about fast shipping? Because of the **Square Root Law of Lead Time**. Predicting demand 2 weeks from now is easy. Predicting demand 12 weeks from now is guessing.")
         
-        l_lead_time = st.slider("Base Supplier Lead Time (Weeks)", 2, 24, 12, key="l_lt_mba")
+        l_base_lead_time = st.slider("Base Supplier Lead Time (Weeks)", 4, 24, 12, key="l_lt_mba")
+        l_surge_lead_time = 2
         
-        # Financial Math based on Little's Law
-        weekly_demand = l_mean / 12.0 # Assuming 1000 units over a 12-week season/quarter
-        pipeline_units = weekly_demand * l_lead_time
-        working_capital = pipeline_units * l_base_cost
-        cost_of_capital = working_capital * (l_holding_pct * (l_lead_time/52.0))
+        dynamic_sigma_surge = l_sigma * math.sqrt(l_surge_lead_time / l_base_lead_time)
+        dynamic_cv_surge = (dynamic_sigma_surge / l_mean) * 100
         
-        dynamic_cv = l_lead_time * 2.5  
-        dynamic_sigma = l_mean * (dynamic_cv / 100.0)
-        
-        col_f1, col_f2, col_f3 = st.columns(3)
-        col_f1.metric("Resulting Volatility (CV)", f"{dynamic_cv:.1f}%")
-        col_f2.metric("Working Capital Tied Up", f"£{int(working_capital):,}")
-        col_f3.metric("Opportunity Cost of Capital", f"£{int(cost_of_capital):,}")
+        col_f1, col_f2 = st.columns(2)
+        col_f1.metric("Base Forecast Volatility (12 weeks out)", f"{l_volatility:.1f}%")
+        col_f2.metric("Surge Forecast Volatility (2 weeks out)", f"{dynamic_cv_surge:.1f}%", delta=f"-{l_volatility - dynamic_cv_surge:.1f}% accuracy gained", delta_color="normal")
         
         x5 = np.linspace(0, 2000, 600)
-        y5 = stats.norm.pdf(x5, l_mean, dynamic_sigma)
-        fig5 = go.Figure()
-        fig5.add_trace(go.Scatter(x=x5, y=y5, fill='tozeroy', fillcolor='rgba(239, 68, 68, 0.2)', line=dict(color='#ef4444', width=3)))
-        fig5.add_vline(x=l_mean, line_dash="dash", line_color="black")
-        fig5.update_layout(height=250, template="plotly_white", xaxis_title="Demand", yaxis_title="Probability Density", yaxis_range=[0, 0.008])
-        st.plotly_chart(fig5, use_container_width=True)
+        y5_base = stats.norm.pdf(x5, l_mean, l_sigma)
+        y5_surge = stats.norm.pdf(x5, l_mean, dynamic_sigma_surge)
         
-        st.error("💡 **Takeaway:** Move the slider to 20 weeks. Notice how the curve flattens out. Because extreme upside spikes become much more likely, your mathematical optimal reliance on the fast Surge supplier grows drastically.")
+        fig5 = go.Figure()
+        fig5.add_trace(go.Scatter(x=x5, y=y5_base, mode='lines', line=dict(color='#ef4444', width=2, dash='dash'), name='Base Forecast (Highly Uncertain)'))
+        fig5.add_trace(go.Scatter(x=x5, y=y5_surge, fill='tozeroy', fillcolor='rgba(16, 185, 129, 0.2)', line=dict(color='#10b981', width=3), name='Surge Forecast (Highly Accurate)'))
+        fig5.add_vline(x=l_mean, line_dash="dash", line_color="black")
+        fig5.update_layout(height=350, template="plotly_white", xaxis_title="Demand", yaxis_title="Probability Density", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+        st.plotly_chart(fig5, use_container_width=True)
 
     with t4:
         st.subheader("Step 4: The Lifecycle Reality")
-        st.markdown("In traditional academic models, unsold goods are liquidated at a loss. But what if your product is shelf-stable? Change the scenario below to see how the Overage Cost ($C_o$) and your optimal Service Level adapt.")
-        
         l_scenario = st.radio("Product Lifecycle Scenario", ["End of Life (Sunset)", "FMCG (Risk of Obsolescence)", "Shelf-Stable (Ongoing)"], index=0, key="l_scen")
-        
-        # Calculate optimal Qs to shade the curve
         nv_b = newsvendor_base(l_salvage, l_base_cost, l_surge_cost, l_mean, l_sigma, 1.85, l_scenario)
-        nv_s = newsvendor_surge(l_price, l_salvage, l_base_cost, l_surge_cost, l_mean, l_sigma, 1.85, l_scenario)
-        q_b, q_t = int(nv_b['optimal_q']), int(nv_s['optimal_q'])
-
+        q_b = int(nv_b['optimal_q'])
+        
         c3, c4 = st.columns([1, 2])
         with c3:
             st.metric("Base Co (Overage Penalty)", f"£{nv_b['co']:.2f}")
-            st.metric("Optimal Base Order", f"{q_b:,} units")
-            st.metric("Optimal Total Order", f"{q_t:,} units")
+            st.metric("Optimal Base Order", f"{int(q_b):,} units")
         with c4:
             x2 = np.linspace(200, 1800, 600)
             y2 = stats.norm.pdf(x2, l_mean, l_sigma)
             fig3 = go.Figure()
             m_base = x2 <= q_b
             fig3.add_trace(go.Scatter(x=np.concatenate([x2[m_base], [q_b, x2[m_base][0]]]), y=np.concatenate([y2[m_base], [0, 0]]), fill='toself', fillcolor='rgba(16,185,129,0.3)', line=dict(color='rgba(0,0,0,0)'), name='Base Coverage'))
-            m_surge = (x2 > q_b) & (x2 <= q_t)
-            fig3.add_trace(go.Scatter(x=np.concatenate([[q_b], x2[m_surge], [q_t, q_b]]), y=np.concatenate([[0], y2[m_surge], [0, 0]]), fill='toself', fillcolor='rgba(245,158,11,0.3)', line=dict(color='rgba(0,0,0,0)'), name='Surge Coverage'))
             fig3.add_trace(go.Scatter(x=x2, y=y2, mode='lines', line=dict(color='#1e3a5f'), showlegend=False))
             fig3.update_layout(height=300, margin=dict(l=0,r=0,t=0,b=0), template="plotly_white")
             st.plotly_chart(fig3, use_container_width=True)
 
-        st.info("💡 **Takeaway:** When inventory doesn't spoil (Shelf-Stable), the penalty for over-ordering drops to almost zero. The model shifts the green area to the right, telling you to buy almost everything from the cheap Base supplier.")
-
     with t5:
-        st.subheader("Step 5: The Bottom Line (Profit & Strategy)")
-        st.markdown("**Target Service Level** isn't an arbitrary goal set by management. It is a mathematical output—the exact probability of *not* stocking out that maximizes your expected profit.")
-        st.markdown("Is dual sourcing actually worth the complexity? Compare the peak of the profit curve below with the single-source alternatives.")
+        st.subheader("Step 5: The Value of Postponement")
+        st.markdown("If you place both orders blindly on Day 1, single-sourcing from China will almost always win mathematically. **The secret to Dual Sourcing is Option Value.** By waiting to place the Surge order until the forecast is highly accurate, you eliminate the massive overage risk. *That* is why it's profitable.")
         
-        df_l_sweep = dual_source_sweep(l_price, l_salvage, l_mean, l_sigma, l_base_cost, l_surge_cost, 0, 0, 1.85, q_b, l_scenario)
+        l_surge_sigma = l_sigma * math.sqrt(2 / 12)
+        df_l_sweep = dual_source_sweep(l_price, l_salvage, l_mean, l_surge_sigma, l_base_cost, l_surge_cost, 1.85, 0.30, q_b, l_scenario)
         l_best = df_l_sweep.loc[df_l_sweep["Exp. Profit (£)"].idxmax()]
         
-        # Standalone comparison for learning tab
         l_base_q_only, l_base_profit = calc_standalone(l_price, l_salvage, l_base_cost, l_mean, l_sigma, 1.85, l_scenario)
-        l_surge_hold = (l_surge_cost / l_base_cost) * 1.85
-        l_surge_q_only, l_surge_profit = calc_standalone(l_price, l_salvage, l_surge_cost, l_mean, l_sigma, l_surge_hold, l_scenario)
+        l_surge_q_only, l_surge_profit = calc_standalone(l_price, l_salvage, l_surge_cost, l_mean, l_surge_sigma, 0.30, l_scenario)
         
         sc1, sc2, sc3 = st.columns(3)
         l_best_single = max(l_base_profit, l_surge_profit)
         l_value_add = l_best['Exp. Profit (£)'] - l_best_single
         sc1.metric("Base Supplier Only", f"£{int(l_base_profit):,}")
         sc2.metric("Surge Supplier Only", f"£{int(l_surge_profit):,}")
-        sc3.metric("Dual Sourcing", f"£{int(l_best['Exp. Profit (£)']):,}", delta=f"+£{int(l_value_add):,} value added")
+        sc3.metric("Dual Sourcing", f"£{int(l_best['Exp. Profit (£)']):,}", delta=f"+£{int(l_value_add):,} value added" if l_value_add > 1 else "0 value added", delta_color="normal")
 
         fig4 = make_subplots(specs=[[{"secondary_y": True}]])
         fig4.add_trace(go.Scatter(x=df_l_sweep["Service Level (%)"], y=df_l_sweep["Exp. Profit (£)"], name="Expected Profit (£)", line=dict(color="#2563eb", width=3)), secondary_y=False)
         fig4.add_vline(x=l_best["Service Level (%)"], line_dash="dash", line_color="red", annotation_text=f"Max Profit at {l_best['Service Level (%)']:.1f}%")
-        fig4.update_layout(height=400, template="plotly_white", xaxis_title="Target Service Level (%)", yaxis_title="Expected Profit (£)")
+        fig4.update_layout(height=350, template="plotly_white", xaxis_title="Target Service Level (%)", yaxis_title="Expected Profit (£)")
         st.plotly_chart(fig4, use_container_width=True)
-        
-        st.markdown("#### Show Your Work: Value of the Surge Hedge")
-        c_f1, c_f2, c_f3 = st.columns(3)
-        expected_surge_sales = l_best["Exp. Sales Total"] - nv_b["exp_sales"]
-        surge_investment = int(l_best["Q Surge"]) * l_surge_cost
-        revenue_protected = int(expected_surge_sales) * l_price
-        net_surge_margin = revenue_protected - surge_investment
-        c_f1.metric("Surge Investment (Cost)", f"£{surge_investment:,}")
-        c_f2.metric("Revenue Protected (Benefit)", f"£{revenue_protected:,}")
-        c_f3.metric("Net Margin Added", f"£{net_surge_margin:,}")
-
-        st.success("🎉 You've mastered the math! You can now switch back to **Pro Mode** in the sidebar to run custom numbers for your own business cases.")
